@@ -1,79 +1,175 @@
+from __future__ import print_function, division
 import os
 import torch
-import torch.utils.data as data
-import torch
-import torchvision.transforms as transforms
-import random
-from PIL import Image, ImageOps
-import preprocess 
-import listflowfile as lt
-import readpfm as rp
+import pandas as pd
+from skimage import io, transform
 import numpy as np
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image, ImageOps
+from dataloader.preprocess import *
+# from utils.preprocess import load_pfm
+from torchvision import transforms
+import time
+# from dataloader.EXRloader import load_exr
 
-IMG_EXTENSIONS = [
-    '.jpg', '.JPG', '.jpeg', '.JPEG',
-    '.png', '.PNG', '.ppm', '.PPM', '.bmp', '.BMP',
-]
+class SceneFlowDataset(Dataset):
 
-def is_image_file(filename):
-    return any(filename.endswith(extension) for extension in IMG_EXTENSIONS)
+    def __init__(self, txt_file, root_dir, phase='train', load_disp=True, load_norm=False, to_angle=False, scale_size=(576, 960)):
+        """
+        Args:
+            txt_file [string]: Path to the image list
+            transform (callable, optional): Optional transform to be applied                on a sample
+        """
+        with open(txt_file, "r") as f:
+            self.imgPairs = f.readlines()
 
-def default_loader(path):
-    return Image.open(path).convert('RGB')
+        self.root_dir = root_dir
+        self.phase = phase
+        self.load_disp = load_disp
+        self.load_norm = load_norm
+        self.to_angle = to_angle
+        self.scale_size = scale_size
+        self.img_size = (540, 960)
 
-def disparity_loader(path):
-    return rp.readPFM(path)
+    def get_img_size(self):
+        return self.img_size
 
-
-class myImageFloder(data.Dataset):
-    def __init__(self, left, right, left_disparity, training, loader=default_loader, dploader= disparity_loader):
- 
-        self.left = left
-        self.right = right
-        self.disp_L = left_disparity
-        self.loader = loader
-        self.dploader = dploader
-        self.training = training
-
-    def __getitem__(self, index):
-        left  = self.left[index]
-        right = self.right[index]
-        disp_L= self.disp_L[index]
-
-
-        left_img = self.loader(left)
-        right_img = self.loader(right)
-        dataL, scaleL = self.dploader(disp_L)
-        dataL = np.ascontiguousarray(dataL,dtype=np.float32)
-
-
-
-        if self.training:  
-           w, h = left_img.size
-           th, tw = 256, 512
- 
-           x1 = random.randint(0, w - tw)
-           y1 = random.randint(0, h - th)
-
-           left_img = left_img.crop((x1, y1, x1 + tw, y1 + th))
-           right_img = right_img.crop((x1, y1, x1 + tw, y1 + th))
-
-           dataL = dataL[y1:y1 + th, x1:x1 + tw]
-
-           processed = preprocess.get_transform(augment=False)  
-           left_img   = processed(left_img)
-           right_img  = processed(right_img)
-
-           return left_img, right_img, dataL
-        else:
-           w, h = left_img.size
-           left_img = left_img.crop((w-960, h-544, w, h))
-           right_img = right_img.crop((w-960, h-544, w, h))
-           processed = preprocess.get_transform(augment=False)  
-           left_img       = processed(left_img)
-           right_img      = processed(right_img)
-
-           return left_img, right_img, dataL
+    def get_scale_size(self):
+        return self.scale_size
 
     def __len__(self):
-        return len(self.left)
+        return len(self.imgPairs)
+
+    def __getitem__(self, idx):
+
+        img_names = self.imgPairs[idx].rstrip().split()
+
+        img_left_name = os.path.join(self.root_dir, img_names[0])
+        img_right_name = os.path.join(self.root_dir, img_names[1])
+        if self.load_disp:
+            gt_disp_name = os.path.join(self.root_dir, img_names[2])
+        if self.load_norm:
+            gt_norm_name = os.path.join(self.root_dir, img_names[3])
+
+        def load_rgb(filename):
+
+            img = None
+            if filename.find('.npy') > 0:
+                img = np.load(filename)
+            else:
+                img = io.imread(filename)
+                if len(img.shape) == 2:
+                    img = img[:,:,np.newaxis]
+                    img = np.pad(img, ((0, 0), (0, 0), (0, 2)), 'constant')
+                    img[:,:,1] = img[:,:,0]
+                    img[:,:,2] = img[:,:,0]
+                h, w, c = img.shape
+                if c == 4:
+                    img = img[:,:,:3]
+            return img
+           
+        def load_disp(filename):
+            gt_disp = None
+            if gt_disp_name.endswith('pfm'):
+                gt_disp, scale = load_pfm(gt_disp_name)
+                gt_disp = gt_disp[::-1, :]
+            elif gt_disp_name.endswith('npy'):
+                gt_disp = np.load(gt_disp_name)
+                gt_disp = gt_disp[::-1, :]
+            else:
+                gt_disp = Image.open(gt_disp_name)
+                gt_disp = np.ascontiguousarray(gt_disp,dtype=np.float32)/256
+
+            return gt_disp
+
+        # def load_norm(filename):
+        #     gt_norm = None
+        #     if filename.endswith('exr'):
+        #         gt_norm = load_exr(filename)
+                
+        #         # transform visualization normal to its true value
+        #         gt_norm = gt_norm * 2.0 - 1.0
+
+        #         ## fix opposite normal
+        #         #m = gt_norm >= 0
+        #         #m[:,:,0] = False
+        #         #m[:,:,1] = False
+        #         #gt_norm[m] = - gt_norm[m]
+
+        #     return gt_norm
+
+        s = time.time()
+        img_left = load_rgb(img_left_name)
+        img_right = load_rgb(img_right_name)
+        if self.load_disp:
+            gt_disp = load_disp(gt_disp_name)
+        if self.load_norm:
+            gt_norm = load_norm(gt_norm_name)
+        #print("load data in %f s." % (time.time() - s))
+
+        s = time.time()
+        if self.phase == 'detect' or self.phase == 'test':
+            img_left = transform.resize(img_left, self.scale_size, preserve_range=True)
+            img_right = transform.resize(img_right, self.scale_size, preserve_range=True)
+
+            # change image pixel value type ot float32
+            img_left = img_left.astype(np.float32)
+            img_right = img_right.astype(np.float32)
+            #scale = RandomRescale((1024, 1024))
+            #sample = scale(sample)
+
+        if self.phase == 'detect' or self.phase == 'test':
+            rgb_transform = default_transform()
+        else:
+            rgb_transform = inception_color_preproccess()
+
+        img_left = rgb_transform(img_left)
+        img_right = rgb_transform(img_right)
+
+        if self.load_disp:
+            gt_disp = gt_disp[np.newaxis, :]
+            gt_disp = torch.from_numpy(gt_disp.copy()).float()
+
+        if self.load_norm:
+            gt_norm = gt_norm.transpose([2, 0, 1])
+            gt_norm = torch.from_numpy(gt_norm.copy()).float()
+
+        if self.phase == 'train':
+
+            h, w = img_left.shape[1:3]
+            # th, tw = 384, 768
+            th, tw = 320, 640
+            top = random.randint(h//4, h - th)
+            left = random.randint(0, w - tw)
+
+            img_left = img_left[:, top: top + th, left: left + tw]
+            img_right = img_right[:, top: top + th, left: left + tw]
+            if self.load_disp:
+                gt_disp = gt_disp[:, top: top + th, left: left + tw]
+            if self.load_norm:
+                gt_norm = gt_norm[:, top: top + th, left: left + tw]
+    
+        if self.to_angle:
+            norm_size = gt_norm.size()
+            gt_angle = torch.empty(2, norm_size[1], norm_size[2], dtype=torch.float)
+            gt_angle[0, :, :] = torch.atan(gt_norm[0, :, :] / gt_norm[2, :, :])
+            gt_angle[1, :, :] = torch.atan(gt_norm[1, :, :] / gt_norm[2, :, :])
+
+
+        sample = {  'img_left': img_left, 
+                    'img_right': img_right, 
+                    'img_names': img_names
+                 }
+
+        if self.load_disp:
+            sample['gt_disp'] = gt_disp
+        if self.load_norm:
+            if self.to_angle:
+                sample['gt_angle'] = gt_angle
+            else:
+                sample['gt_norm'] = gt_norm
+
+        #print("deal data in %f s." % (time.time() - s))
+
+        return sample
+

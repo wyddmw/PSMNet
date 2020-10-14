@@ -4,10 +4,7 @@ import os
 import random
 import torch
 import torch.nn as nn
-import torch.nn.parallel
-import torch.backends.cudnn as cudnn
 import torch.optim as optim
-import torch.utils.data
 from torch.autograd import Variable
 import torch.nn.functional as F
 import numpy as np
@@ -22,11 +19,11 @@ parser.add_argument('--maxdisp', type=int ,default=192,
                     help='maxium disparity')
 parser.add_argument('--model', default='stackhourglass',
                     help='select model')
-parser.add_argument('--datapath', default='dataset/',
+parser.add_argument('--datapath', default='/media/jiaren/ImageNet/SceneFlowData/',
                     help='datapath')
-parser.add_argument('--epochs', type=int, default=10,
+parser.add_argument('--epochs', type=int, default=0,
                     help='number of epochs to train')
-parser.add_argument('--loadmodel', default= None,
+parser.add_argument('--loadmodel', default= './trained/pretrained_sceneflow.tar',
                     help='load model')
 parser.add_argument('--savemodel', default='./',
                     help='save model')
@@ -36,9 +33,6 @@ parser.add_argument('--seed', type=int, default=1, metavar='S',
                     help='random seed (default: 1)')
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
-
-# set gpu id used
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 torch.manual_seed(args.seed)
 if args.cuda:
@@ -67,8 +61,9 @@ if args.cuda:
     model.cuda()
 
 if args.loadmodel is not None:
-    state_dict = torch.load(args.loadmodel)
-    model.load_state_dict(state_dict['state_dict'])
+    print('Load pretrained model')
+    pretrain_dict = torch.load(args.loadmodel)
+    model.load_state_dict(pretrain_dict['state_dict'])
 
 print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
@@ -76,9 +71,6 @@ optimizer = optim.Adam(model.parameters(), lr=0.001, betas=(0.9, 0.999))
 
 def train(imgL,imgR, disp_L):
         model.train()
-        imgL   = Variable(torch.FloatTensor(imgL))
-        imgR   = Variable(torch.FloatTensor(imgR))   
-        disp_L = Variable(torch.FloatTensor(disp_L))
 
         if args.cuda:
             imgL, imgR, disp_true = imgL.cuda(), imgR.cuda(), disp_L.cuda()
@@ -103,30 +95,48 @@ def train(imgL,imgR, disp_L):
         loss.backward()
         optimizer.step()
 
-        return loss.data[0]
+        return loss.data
 
 def test(imgL,imgR,disp_true):
-        model.eval()
-        imgL   = Variable(torch.FloatTensor(imgL))
-        imgR   = Variable(torch.FloatTensor(imgR))   
-        if args.cuda:
-            imgL, imgR = imgL.cuda(), imgR.cuda()
 
+        model.eval()
+  
+        if args.cuda:
+            imgL, imgR, disp_true = imgL.cuda(), imgR.cuda(), disp_true.cuda()
         #---------
         mask = disp_true < 192
         #----
 
+        if imgL.shape[2] % 16 != 0:
+            times = imgL.shape[2]//16       
+            top_pad = (times+1)*16 -imgL.shape[2]
+        else:
+            top_pad = 0
+
+        if imgL.shape[3] % 16 != 0:
+            times = imgL.shape[3]//16                       
+            right_pad = (times+1)*16-imgL.shape[3]
+        else:
+            right_pad = 0  
+
+        imgL = F.pad(imgL,(0,right_pad, top_pad,0))
+        imgR = F.pad(imgR,(0,right_pad, top_pad,0))
+
         with torch.no_grad():
             output3 = model(imgL,imgR)
-
-        output = torch.squeeze(output3.data.cpu(),1)[:,4:,:]
+            output3 = torch.squeeze(output3)
+        
+        if top_pad !=0:
+            img = output3[:,top_pad:,:]
+        else:
+            img = output3
 
         if len(disp_true[mask])==0:
            loss = 0
         else:
-           loss = torch.mean(torch.abs(output[mask]-disp_true[mask]))  # end-point-error
+           loss = F.l1_loss(img[mask],disp_true[mask]) #torch.mean(torch.abs(img[mask]-disp_true[mask]))  # end-point-error
 
-        return loss
+        return loss.data.cpu()
 
 def adjust_learning_rate(optimizer, epoch):
     lr = 0.001
@@ -138,7 +148,7 @@ def adjust_learning_rate(optimizer, epoch):
 def main():
 
 	start_full_time = time.time()
-	for epoch in range(1, args.epochs+1):
+	for epoch in range(0, args.epochs):
 	   print('This is %d-th epoch' %(epoch))
 	   total_train_loss = 0
 	   adjust_learning_rate(optimizer,epoch)

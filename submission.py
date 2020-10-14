@@ -4,33 +4,24 @@ import os
 import random
 import torch
 import torch.nn as nn
-import torch.nn.parallel
-import torch.backends.cudnn as cudnn
-import torch.optim as optim
-import torch.utils.data
-from torch.autograd import Variable
+import torchvision.transforms as transforms
 import torch.nn.functional as F
-import skimage
-import skimage.io
-import skimage.transform
 import numpy as np
 import time
 import math
-from utils import preprocess 
 from models import *
-
-# 2012 data /media/jiaren/ImageNet/data_scene_flow_2012/testing/
+from PIL import Image
 
 parser = argparse.ArgumentParser(description='PSMNet')
 parser.add_argument('--KITTI', default='2015',
                     help='KITTI version')
 parser.add_argument('--datapath', default='/media/jiaren/ImageNet/data_scene_flow_2015/testing/',
                     help='select model')
-parser.add_argument('--loadmodel', default=None,
+parser.add_argument('--loadmodel', default='./trained/pretrained_model_KITTI2015.tar',
                     help='loading model')
 parser.add_argument('--model', default='stackhourglass',
                     help='select model')
-parser.add_argument('--maxdisp', type=int, default=192,
+parser.add_argument('--maxdisp', default=192,
                     help='maxium disparity')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='enables CUDA training')
@@ -47,7 +38,6 @@ if args.KITTI == '2015':
    from dataloader import KITTI_submission_loader as DA
 else:
    from dataloader import KITTI_submission_loader2012 as DA  
-
 
 test_left_img, test_right_img = DA.dataloader(args.datapath)
 
@@ -68,51 +58,63 @@ if args.loadmodel is not None:
 print('Number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
 def test(imgL,imgR):
-        model.eval()
+    model.eval()
 
-        if args.cuda:
-           imgL = torch.FloatTensor(imgL).cuda()
-           imgR = torch.FloatTensor(imgR).cuda()     
+    if args.cuda:
+        imgL = imgL.cuda()
+        imgR = imgR.cuda()     
 
-        imgL, imgR= Variable(imgL), Variable(imgR)
-
-        with torch.no_grad():
-            output = model(imgL,imgR)
-        output = torch.squeeze(output)
-        pred_disp = output.data.cpu().numpy()
-
-        return pred_disp
-
+    with torch.no_grad():
+        output = model(imgL,imgR)
+    output = torch.squeeze(output).data.cpu().numpy()
+    return output
 
 def main():
-   processed = preprocess.get_transform(augment=False)
+    normal_mean_var = {'mean': [0.485, 0.456, 0.406],
+                        'std': [0.229, 0.224, 0.225]}
+    infer_transform = transforms.Compose([transforms.ToTensor(),
+                                            transforms.Normalize(**normal_mean_var)])    
 
-   for inx in range(len(test_left_img)):
+    for inx in range(len(test_left_img)):
 
-       imgL_o = (skimage.io.imread(test_left_img[inx]).astype('float32'))
-       imgR_o = (skimage.io.imread(test_right_img[inx]).astype('float32'))
-       imgL = processed(imgL_o).numpy()
-       imgR = processed(imgR_o).numpy()
-       imgL = np.reshape(imgL,[1,3,imgL.shape[1],imgL.shape[2]])
-       imgR = np.reshape(imgR,[1,3,imgR.shape[1],imgR.shape[2]])
+        imgL_o = Image.open(test_left_img[inx]).convert('RGB')
+        imgR_o = Image.open(test_right_img[inx]).convert('RGB')
 
-       # pad to (384, 1248)
-       top_pad = 384-imgL.shape[2]
-       left_pad = 1248-imgL.shape[3]
-       imgL = np.lib.pad(imgL,((0,0),(0,0),(top_pad,0),(0,left_pad)),mode='constant',constant_values=0)
-       imgR = np.lib.pad(imgR,((0,0),(0,0),(top_pad,0),(0,left_pad)),mode='constant',constant_values=0)
+        imgL = infer_transform(imgL_o)
+        imgR = infer_transform(imgR_o)         
 
-       start_time = time.time()
-       pred_disp = test(imgL,imgR)
-       print('time = %.2f' %(time.time() - start_time))
+        # pad to width and hight to 16 times
+        if imgL.shape[1] % 16 != 0:
+            times = imgL.shape[1]//16       
+            top_pad = (times+1)*16 -imgL.shape[1]
+        else:
+            top_pad = 0
 
-       top_pad   = 384-imgL_o.shape[0]
-       left_pad  = 1248-imgL_o.shape[1]
-       img = pred_disp[top_pad:,:-left_pad]
-       skimage.io.imsave(test_left_img[inx].split('/')[-1],(img*256).astype('uint16'))
+        if imgL.shape[2] % 16 != 0:
+            times = imgL.shape[2]//16                       
+            right_pad = (times+1)*16-imgL.shape[2]
+        else:
+            right_pad = 0    
+
+        imgL = F.pad(imgL,(0,right_pad, top_pad,0)).unsqueeze(0)
+        imgR = F.pad(imgR,(0,right_pad, top_pad,0)).unsqueeze(0)
+
+        start_time = time.time()
+        pred_disp = test(imgL,imgR)
+        print('time = %.2f' %(time.time() - start_time))
+
+        if top_pad !=0 or right_pad != 0:
+            img = pred_disp[top_pad:,:-right_pad]
+        else:
+            img = pred_disp
+
+        img = (img*256).astype('uint16')
+        img = Image.fromarray(img)
+        img.save(test_left_img[inx].split('/')[-1])
+
 
 if __name__ == '__main__':
-   main()
+    main()
 
 
 
